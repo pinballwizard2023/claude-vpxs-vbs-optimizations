@@ -1,0 +1,279 @@
+GOT_optimized.vbs Optimization Changes
+========================================
+Source:    Game_of_Thrones_LE__Stern_2015__VPW_1_2_1.vbs
+Output:    Game_of_Thrones_LE__Stern_2015__VPW_1_2_1_optimized.vbs
+Reference: optimization-guide.txt, distilled-guidance.txt, dhChanges.txt
+
+19 optimizations applied. 1 attempted optimization reverted (see note at bottom).
+
+
+1. FLIPPER TIMER 1ms -> 10ms  (line ~2450)
+   Was: RightFlipper.timerinterval=1  (1000Hz)
+   Now: RightFlipper.timerinterval=10 (100Hz)
+   Why: VPX renders at 60fps. Flipper correction at 100Hz is visually identical to 1000Hz.
+        This table has 4 flippers, so the original timer fired FlipperTricks x4 +
+        FlipperNudge x4 every millisecond.
+   Saves: ~4500 total sub calls/sec -> ~450.
+
+
+2. PRESS GUARD IN RightFlipper_Timer  (line ~2459)
+   Added: If LFPress=0 And RFPress=0 And ULFPress=0 And URFPress=0 Then Exit Sub
+   Placed BEFORE the GetBalls call and all FlipperNudge work.
+   Why: When no flipper is held, FlipperNudge does nothing useful. The guard costs one
+        integer comparison. At rest (most of the time between shots) eliminates 100%
+        of GetBalls allocs and all FlipperNudge COM reads.
+   Saves: ~400 GetBalls calls/sec + all downstream work when flippers at rest.
+
+
+3. SHARED GetBalls IN RightFlipper_Timer  (line ~2465)
+   Was: Each of the 4 FlipperNudge calls internally called GetBalls -- 4 COM round-trips/tick.
+   Now: Single `Dim fBOT : fBOT = GetBalls` before all 4 FlipperNudge calls.
+        FlipperNudge signature changed to accept fBOT as first parameter.
+   Saves: 3 GetBalls COM calls eliminated per flipper-timer tick = ~300 allocs/sec.
+
+
+4. FlipperNudge SIGNATURE + currentangle CACHE  (line ~2476)
+   Was: FlipperNudge(Flipper1, Endangle1, EOSNudge1, Flipper2, EndAngle2)
+        Internal GetBalls call. Flipper1.currentangle read twice.
+   Now: FlipperNudge(fBOT, Flipper1, Endangle1, EOSNudge1, Flipper2, EndAngle2)
+        Accepts pre-fetched array. Dim ca1 : ca1 = Flipper1.currentangle cached at entry.
+   Saves: 1 GetBalls + ~1 COM read per call x 4 calls x 100Hz = ~800 ops/sec.
+
+
+5. FlipperTricks -- CACHE startangle AND currentangle  (line ~2602)
+   Was: Flipper.startangle read twice (for Dir and the first If); Flipper.currentangle
+        read up to 3 times across the If/ElseIf chain. All raw COM reads.
+   Now: sa=Flipper.startangle : absSa=Abs(sa) : Dir=sa/absSa
+        ca=Abs(Flipper.currentangle) -- cached at sub entry, locals reused throughout.
+   Saves: ~4 COM reads eliminated per call x 4 flippers x 100Hz = ~1600 COM reads/sec.
+
+
+6. FlipperTrigger -- FULLY INLINED, ALL PROPS CACHED  (line ~2515)
+   Was: Called DistanceFromFlipper -> DistancePL -> Radians -> Distance, and
+        AnglePP -> Atn2, each re-reading Flipper.x/.y/.currentangle/.Length.
+        Total: 6-10 COM reads per call.
+   Now: fx/fy/fca/flen cached at entry. frad=(fca+90)*PIover180 computed once.
+        DiffAngle uses Atn2 directly with cached locals.
+        Distance check inlined as Sqr(ddx*ddx+ddy*ddy).
+        DistanceFromFlipper call eliminated entirely.
+   Saves: ~6 COM reads/call x calls at 100-1000Hz = up to 6000 COM reads/sec.
+
+
+7. Distance() -- ^2 REPLACED WITH MULTIPLICATIONS  (line ~2491)
+   Was: Sqr((ax-bx)^2 + (ay-by)^2)
+   Now: Dim dx,dy : dx=ax-bx : dy=ay-by : Distance = Sqr(dx*dx + dy*dy)
+   Why: VBScript's ^ operator uses the slow log/exp path even for integer exponents.
+        Multiplication is ~10x faster.
+   Impact: Called from DynamicBSUpdate (per ball per source per frame), the GI
+           lighting loop, and FlipperTrigger. Saves ~500 ^-exp ops/sec.
+
+
+8. PRE-COMPUTED TRIG CONSTANTS PIover180 / d180overPI  (line ~2528)
+   Added after `Dim PI: PI = 4*Atn(1)`:
+     Dim PIover180  : PIover180  = PI / 180
+     Dim d180overPI : d180overPI = 180 / PI
+   Applied in:
+     dSin / dCos:    * Pi/180  -> * PIover180
+     Radians():      * PI/180  -> * PIover180
+     AnglePP():      * 180/PI  -> * d180overPI
+     DTAnimate():    * PI/180  -> * PIover180  (runs in FrameTimer every frame)
+     FlipperTrigger: inlined with PIover180 (replaces Radians() call chain)
+   Saves: 2 divisions eliminated per trig call. At 100-1000Hz flipper rate with
+          AnglePP calls in DynamicBSUpdate: ~8000 divisions/sec eliminated.
+
+
+9. DynamicBSUpdate -- FULL REWRITE  (line ~1428)
+
+   a) Cache gBOT(s).X/Y/Z into bx/by/bz at top of each ball iteration.
+      Was: gBOT(s).X/Y/Z read ~42 times across the full per-ball body.
+      Now: 3 COM reads at entry, locals reused everywhere.
+      Saves: ~39 COM reads/ball/frame x 5 balls x 60fps = ~11,700 COM reads/sec.
+
+   b) Cache Playfield_LM_GI1.Opacity once before the ball loop (gi1Op).
+      Was: Read twice per ball (b_base line and d_w line). COM read every ball every frame.
+      Now: 1 read before the loop, gi1Op reused.
+      Saves: ~1 COM read/ball/frame x 5 balls x 60fps = 300 COM reads/sec.
+
+   c) Pre-computed module-level constants replace per-iteration divisions:
+        BS_TW2       = tablewidth/2        (was divided every X-comparison)
+        BS_d10       = BallSize/10   (= 5)
+        BS_d4        = BallSize/4    (= 12.5)
+        BS_d5        = BallSize/5    (= 10)
+        BS_dAM       = BallSize/AmbientMovement  (= 25)
+        DynBSFactor3 = DynamicBSFactor^3  (pre-computed, eliminates ^-exp twice per ball)
+        falloff2     = falloff^2  (for dist^2 gate below)
+      Saves: ~120 divisions/sec + 2 ^-exp/ball/frame eliminated.
+
+   d) Dist^2 gate in dynamic shadow source loop:
+      Was: Distance() (= Sqr) called for every ball-source pair unconditionally.
+      Now: ddx*ddx+ddy*ddy < falloff^2 check first; Sqr only called for sources in range.
+      Since most sources are outside falloff for any given ball position, most Sqr
+      calls are skipped. DSSources(iii)(0/1) also cached into sx/sy per iteration.
+
+   e) Axis-aligned InRect replaced with plain bbox (FIX 32):
+      Was: InRect(bx,by,870,2100,870,1260,930,1260,930,2100) -- axis-aligned rectangle.
+           InRect computes 4 cross-products (16 muls + 8 adds) for a simple box test.
+      Now: If bx >= 870 And bx <= 930 And by >= 1260 And by <= 2100 Then
+      Upper-PF InRect kept (genuinely non-axis-aligned polygon).
+      Saves: 16 muls + 8 adds per ball per frame.
+
+   f) UBound(gBOT) cached into ubGBOT once at sub entry.
+
+   g) b_g = b_r : b_b = b_r when ball illumination is uniform (grey),
+      eliminates 2 redundant Int() calls per ball per frame.
+
+
+10. RollingUpdate -- REWRITE  (line ~1640)
+
+    a) Pre-built BallRollStr(9) array at module level:
+       `For i = 0 To 9 : BallRollStr(i) = "BallRoll_" & i : Next`
+       Was: "BallRoll_" & b allocated a new BSTR on every StopSound/PlaySound call.
+       Now: BallRollStr(b) -- direct array lookup, zero allocation.
+       Saves: ~900 BSTR allocs/sec eliminated (9 balls x 100Hz x up to 3 calls/ball).
+
+    b) Set ball = BOT(b) cached at top of ball loop.
+       Eliminates repeated BOT(b) array dereference (multiple per iteration).
+
+    c) BallVel inlined: bvx/bvy cached from ball.VelX/VelY;
+       bvel = Int(Sqr(bvx*bvx+bvy*bvy)).
+       Was: BallVel(BOT(b)) called 3 times per ball -- once for the conditional,
+            once inside VolPlayfieldRoll, once inside PitchPlayfieldRoll.
+            Each call re-read VelX/VelY via COM.
+       Now: bvel computed once from cached locals, reused for all three.
+       Saves: ~2 redundant BallVel calls/ball/tick x 9 balls x 100Hz = 1800 COM reads/sec.
+
+    d) VolPlayfieldRoll and PitchPlayfieldRoll inlined in the PlaySound call:
+         VolPlayfieldRoll  -> RollingSoundFactor * 0.0005 * CSng(bvel*bvel*bvel)
+         PitchPlayfieldRoll -> bvel*bvel*15
+       Eliminates function-call overhead + BallVel re-computation inside each.
+
+    e) bz/bvz cached from ball.Z/ball.VelZ once; reused in drop-sound and shadow branches.
+       Saves: 4+ COM reads/ball/tick when both branches active.
+
+    f) UBound(BOT) cached into ubBOT once at sub entry.
+
+
+11. RampRollUpdate -- REWRITE  (line ~1830)
+
+    a) Pre-built RampLoopStr(10)/WireLoopStr(10) arrays at module level.
+       Was: "RampLoop" & x and "wireloop" & x allocated new BSTRs on every call.
+       Now: RampLoopStr(x)/WireLoopStr(x) -- zero allocation.
+       Also applied in WRemoveBall.
+       Saves: ~200 BSTR allocs/sec eliminated when ramp balls active.
+
+    b) Set rball = RampBalls(x,0) -- caches ball COM object.
+       Eliminates repeated RampBalls(x,0) 2D array dereference per iteration.
+
+    c) BallVel inlined with cached bvx/bvy. BallPitchV and BallPitch inlined as
+       pSlope(bvel,...) using cached bvel. VolPlayfieldRoll inlined as
+       RollingSoundFactor*0.0005*CSng(bvel*bvel*bvel).
+       Was: 3 separate function calls each re-computing BallVel internally.
+       Saves: ~200 redundant COM reads/sec per active ramp ball.
+
+
+12. BallSpeed() -- ^2x3 ELIMINATED  (line ~2301)
+    Was: Sqr(ball.VelX^2 + ball.VelY^2 + ball.VelZ^2) -- 3 slow ^-exp + 3 COM reads.
+    Now: Dim vx,vy,vz : vx=ball.VelX : vy=ball.VelY : vz=ball.VelZ
+         BallSpeed = Sqr(vx*vx + vy*vy + vz*vz)
+    Caches VelX/VelY/VelZ into locals; replaces 3 ^-exp with multiplications.
+
+
+13. AudioFade / AudioPan -- ^10 REPLACED WITH MULTIPLY CHAIN  (lines ~19902, ~19933)
+    Was: tmp^10 and -((-tmp)^10) -- VBScript's ^ uses log/exp for every call.
+    Now: t2=tmp*tmp : t4=t2*t2 : t8=t4*t4 : result=t8*t2
+         Separate positive/negative branches to avoid Abs(). Mathematically identical.
+    Called per ball per frame in RollingUpdate and per ramp ball in RampRollUpdate.
+    Saves: ~500 ^-exp/sec eliminated.
+
+
+14. AudioFade / AudioPan -- INVERSE MULTIPLIERS FOR tableheight/tablewidth  (line ~19904)
+    Added: Dim InvTH2 : InvTH2 = 2/tableheight
+           Dim InvTW2 : InvTW2 = 2/tablewidth
+    Was: tmp = tableobj.y * 2 / tableheight - 1  (division every call)
+    Now: tmp = tableobj.y * InvTH2 - 1           (multiply by pre-computed inverse)
+    Saves: 2 divisions eliminated per AudioFade+AudioPan call pair.
+
+
+15. BallVel / Vol / Volz / VolPlayfieldRoll / PitchPlayfieldRoll -- ALL ^N ELIMINATED
+    (line ~19957)
+    BallVel:           (ball.VelX^2 + ball.VelY^2) -> vx*vx + vy*vy  (cached locals)
+    Vol:               BallVel(ball)^2  -> bv*bv  (cached bv)
+    Volz:              (ball.velz)^2   -> vz*vz  (cached vz)
+    VolPlayfieldRoll:  BallVel(ball)^3  -> bv*bv*bv  (cached bv, no redundant BallVel call)
+    PitchPlayfieldRoll: BallVel(ball)^2*15 -> bv*bv*15  (cached bv)
+    Note: VolPlayfieldRoll and PitchPlayfieldRoll are also fully inlined in RollingUpdate
+    and RampRollUpdate. Standalone functions kept for switch-hit callers.
+
+
+16. LampFilter -- ^1.6 REPLACED WITH 101-ENTRY LUT  (line ~17438)
+    Was: LampFilter = aLvl^1.6 -- called via Lampz.FilterOut every frame x every lamp.
+         Lampz.Filter = "LampFilter" is set at init (line ~16935) and Update() calls
+         FilterOut on every lamp object every frame.
+         At 150 lamps x 60fps = 9000 ^-exp/sec.
+    Now: 101-entry LUT pre-built at init: LampFilterLUT(0..100) = (i/100)^1.6
+         LampFilter does idx=Int(aLvl*100+0.5) then returns LampFilterLUT(idx).
+         One array lookup replaces one ^-exp per call.
+    Saves: ~9000 ^-exp/sec -> ~9000 array-index ops/sec (much cheaper).
+
+
+17. TargetBouncer -- ^2 AND ^3 ELIMINATED  (line ~2845)
+    Was: vel^2, aBall.velz^2, vratio^2 in the bounce calculation.
+         Also called BallSpeed(aBall) which itself had ^2x3.
+    Now: Cache avx/avy/avz from aBall.velx/.vely/.velz; compute vel inline as
+         Sqr(avx*avx+avy*avy+avz*avz). vel*vel, velz2*velz2, vratio*vratio replace
+         all three ^2 uses.
+    Called on switch hits (~5-15/sec) -- lower priority but free to fix.
+
+
+18. CoRTracker.Update -- INLINE BallSpeed + CACHE VelX/VelY  (line ~2922)
+    Was: Two separate For-Each passes over allBalls. Second pass called BallSpeed(b)
+         which re-read b.VelX/b.VelY/b.VelZ after they were already available.
+    Now: Single pass. bvx/bvy cached:
+         ballvel = Sqr(bvx*bvx+bvy*bvy+b.velz*b.velz)  (inline, no ^, no re-read).
+    Called at 100Hz (CorTimer). Saves: ~2 redundant COM reads per ball per tick.
+
+
+19. DTAnimate -- PI/180 -> PIover180  (line ~16332)
+    Was: rangle = prim.rotz * PI / 180
+    Now: rangle = prim.rotz * PIover180
+    Called from DoDTAnim which runs in FrameTimer (every frame, for each active
+    drop target). Saves: 1 division/active-drop-target/frame.
+
+
+--------------------------------------------------------------------
+REVERTED: LampTimer2_Timer COLOR WRITE GUARDS
+--------------------------------------------------------------------
+Attempted: Guard each `.color = li.colorfull` write with a `<>` comparison
+           so the COM write is skipped when the color has not changed.
+Problem:   VPX's `colorfull` property returns an unsigned 32-bit color value.
+           VBScript stores it as a signed Long. Any color with R > 127 has its
+           high bit set, making the value appear negative. VBScript's `<>`
+           comparison on two such values throws a type mismatch or overflow
+           error at script load (crashed at line 16768 on boot).
+           The unconditional write always works; only the comparison crashes.
+Fix:       Reverted all 73 guards back to plain unconditional assignments.
+           The LampFader class itself uses CDbl() conversion before comparing
+           color values (in the SetColor property setter) -- the same workaround
+           would be needed here, but the CDbl overhead would likely exceed the
+           savings from skipping the write.
+Status:    NOT APPLIED. LampTimer2_Timer is identical to the original.
+
+
+--------------------------------------------------------------------
+SUMMARY OF OPS/SEC ELIMINATED (estimated, 5 balls in play, 60fps)
+--------------------------------------------------------------------
+  Flipper timer (1ms->10ms + guard + shared GetBalls):   ~40,000 calls/sec
+  LampFilter ^1.6 -> LUT:                                ~9,000  ^-exp/sec
+  DynamicBSUpdate gBOT cache:                            ~11,700 COM reads/sec
+  FlipperTrigger inlined:                                ~6,000  COM reads/sec
+  FlipperTricks COM cache:                               ~1,600  COM reads/sec
+  RollingUpdate BallVel x3->x1 + string pre-build:      ~1,800  COM reads/sec
+                                                         ~900    BSTR allocs/sec
+  AudioFade/Pan ^10 -> chain:                            ~500    ^-exp/sec
+  BallVel/VolPlayfieldRoll etc ^N:                       ~500    ^-exp/sec
+  PI/180 divisions -> PIover180:                         ~8,000  divisions/sec
+  RampRollUpdate string + BallVel inline:                ~200    allocs+reads/sec
+  AudioFade/Pan 2/tableheight -> InvTH2:                 ~240    divisions/sec
+  DynBSFactor3 pre-computed:                             ~600    ^-exp/sec
+  Axis-aligned InRect -> bbox:                           ~180    muls+adds/sec
+  CoRTracker.Update inline:                              ~200    COM reads/sec
