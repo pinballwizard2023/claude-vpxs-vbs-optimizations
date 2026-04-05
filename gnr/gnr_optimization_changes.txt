@@ -1,0 +1,300 @@
+GNR (Guns N' Roses) VPX Script Optimization Changes
+=====================================================
+Table: gnr_300 (Data East 1994) — VPX port by Team PP 2017
+Script: vpxFile.vbs (~4916 lines)
+
+
+1. FLIPPER TIMER 1ms → 10ms + SHARED GetBalls + PRESS GUARD (line ~3361)
+   Changed RightFlipper.timerinterval from 1 to 10.
+   RightFlipper_timer() now guards FlipperNudge calls with:
+     If LFPress = 0 And RFPress = 0 Then Exit Sub
+   Single shared GetBalls call passed to both FlipperNudge calls instead of
+   each calling GetBalls internally.
+   FlipperNudge signature changed to accept BOT array as first parameter.
+   Removed two debug.print statements from FlipperNudge (string concatenation
+   in hot path: Flipper1.currentangle &" = "& Endangle1 &"--"& ...).
+
+   SAVES: ~4,500 function calls/sec (1000Hz → 100Hz).
+   ~1,000 GetBalls allocs/sec eliminated (2 per tick × 1000Hz → 0 when
+   flippers at rest, 1 shared call at 100Hz when pressed).
+   String concat debug.print: ~2,000 string allocs/sec eliminated.
+
+
+2. FlipperTricks — CACHE startangle AND currentangle (line ~3606)
+   Added at sub entry:
+     Dim sa : sa = Flipper.startangle
+     Dim Dir : Dir = sa / Abs(sa)
+     Dim ca : ca = Abs(Flipper.currentangle)
+     Dim absSa : absSa = Abs(sa)
+   Replaced all Abs(Flipper.currentangle) with ca (was read 4× per call).
+   Replaced all Abs(Flipper.startangle) with absSa (was read 3× per call).
+   Left Flipper.endangle reads alone (can change mid-sub via assignment).
+
+   SAVES: ~2,000 COM reads/sec (7 redundant reads × 2 flippers × 100Hz).
+   At original 1000Hz: would have been ~14,000/sec.
+
+
+3. FlipperNudge — CACHE currentangle + ball position (line ~3373)
+   Cached Flipper1.currentangle → ca1 at sub entry.
+   Cached BOT(b).x, BOT(b).y → bx, by before FlipperTrigger calls.
+   Replaced Abs(Flipper1.currentangle) with Abs(ca1) in Else branch.
+
+   SAVES: ~400 COM reads/sec (2 flippers × 100Hz × ~2 reads saved per call).
+
+
+4. FlipperTrigger — INLINE DistanceFromFlipper, CACHE ALL FLIPPER PROPS (line ~3510)
+   Cached Flipper.x → fx, Flipper.y → fy, Flipper.currentangle → fca,
+   Flipper.Length → flen (4 COM reads instead of 6-10).
+   Inlined DistanceFromFlipper to use cached locals directly.
+   Uses PIover180/d180overPI instead of runtime Pi/180 and 180/Pi division.
+   Original code read Flipper.x 3×, Flipper.y 2×, Flipper.currentangle 2×
+   across FlipperTrigger → DistanceFromFlipper → AnglePP → Distance chain.
+
+   SAVES: ~3,000 COM reads/sec (at 100Hz × 2 flippers × ~4 balls × ~4 saved).
+   At original 1000Hz: would have been ~30,000/sec.
+
+
+5. RollingTimer_Timer REWRITE (line ~1949)
+   - Pre-built BallRollStr(0..10) and RampLoopStr(0..10) arrays at init.
+     Eliminates "BallRoll_" & b and "ramploop" & b concatenation per ball per tick.
+   - Cached UBound(BOT) → ubBot once at sub entry.
+   - Inlined BallVel: cache BOT(b).VelX/VelY → bvx/bvy, compute
+     bv = Int(Sqr(bvx*bvx + bvy*bvy)) once per ball.
+   - Inlined VolPlayfieldRoll: rollVol = RollingSoundFactor * 0.0005 * Csng(bv*bv*bv)
+     directly from cached bv (was: BallVel called 3× via VolPlayfieldRoll +
+     PitchPlayfieldRoll + direct check).
+   - Inlined PitchPlayfieldRoll: rollPitch = bv * bv * 15.
+   - Cached BOT(b).VelZ → bvz, BOT(b).z → bz for drop sound checks.
+   - Used pre-computed BS_d4/BS_d2/BS_d5 for static ball shadow math.
+
+   SAVES: ~1,500 string allocs/sec (5 balls × 3 concat sites × 100Hz).
+   ~4,000 COM reads/sec (10 reads → 4 per ball × 5 balls × 100Hz = 3,000;
+   plus UBound savings).
+   ~500 Sqr() calls/sec (3 Sqr → 1 per ball × 5 balls × 100Hz).
+
+
+6. AudioFade/AudioPan/Pan — ^10 ELIMINATION + PRE-COMPUTED INVERSES (line ~4049)
+   Replaced tmp ^10 with chained multiplication:
+     t2=tmp*tmp : t4=t2*t2 : t8=t4*t4 : result = t8*t2
+   Handles negative branch separately with nt = -tmp.
+   Replaced * 2 / tableheight with * InvTHHalf (pre-computed at module level).
+   Replaced * 2 / tablewidth with * InvTWHalf.
+   Applied same fix to Pan() function (line ~1864).
+
+   Pre-computed constants added at module level:
+     Dim InvTWHalf : InvTWHalf = 2 / tablewidth
+     Dim InvTHHalf : InvTHHalf = 2 / tableheight
+
+   SAVES: ~800 exponentiations/sec (AudioFade + AudioPan + Pan called ~200×/sec
+   from RollingTimer per ball + every PlaySound call).
+   ~400 divisions/sec (/ tableheight and / tablewidth eliminated).
+
+
+7. PRE-COMPUTED TRIG CONSTANTS (line ~4674)
+   Added after PI declaration:
+     Dim PIover180 : PIover180 = PI / 180
+     Dim d180overPI : d180overPI = 180 / PI
+   Updated dSin, dCos: degrees * PIover180 (was * Pi / 180).
+   Updated Radians: Degrees * PIover180 (was * PI / 180).
+   Updated AnglePP: * d180overPI (was * 180 / PI).
+
+   SAVES: ~800 divisions/sec (2 divisions per trig call × ~400 calls/sec
+   from FlipperTrigger + DynamicBSUpdate AnglePP).
+
+
+8. Distance — ^2 → x*x (line ~3498)
+   Replaced (ax - bx)^2 + (ay - by)^2 with dx*dx + dy*dy pattern.
+   VBScript ^2 = Exp(2*Log(x)), not a simple multiply.
+
+   SAVES: ~400 exponentiations/sec (called from FlipperTrigger, CheckLiveCatch,
+   FlipperDeactivate, DynamicBSUpdate).
+
+
+9. BallVel/Vol/Volz/BallSpeed — ^2 → x*x + COM CACHING (line ~4090)
+   BallVel: cached ball.VelX/VelY into vx/vy locals. vx*vx + vy*vy replaces ^2.
+   Vol: cached BallVel result, bv*bv replaces ^2.
+   Volz: cached ball.velz into vz, vz*vz replaces ^2.
+   BallSpeed: cached ball.VelX/VelY/VelZ into locals, x*x replaces ^2.
+
+   SAVES: ~1,500 exponentiations/sec (BallSpeed from cor.Update at 100Hz ×
+   5 balls = 500 calls; Vol/Volz from hit handlers ≈ occasional).
+
+
+9b. VolPlayfieldRoll/PitchPlayfieldRoll — ^3/^2 → MULTIPLY (line ~4111)
+    VolPlayfieldRoll: cached BallVel result, bv*bv*bv replaces ^3.
+    PitchPlayfieldRoll: bv*bv replaces ^2.
+    Note: hot-path RollingTimer inlines these entirely; standalone functions
+    remain for non-hot callers (switch hit handlers etc.).
+
+    SAVES: Minor for standalone functions; main savings captured in Fix 5.
+
+
+10. DynamicBSUpdate REWRITE (line ~4813)
+    - Cache BOT(s).X/Y/Z → bx/by/bz at top of each ball iteration.
+      Eliminates 10-15 COM property reads per ball per frame.
+    - Cache DSSources(iii)(0)/(1) → sx/sy before inner source loop.
+      Eliminates double array dereference per light source.
+    - Distance-squared gate: compute dx*dx+dy*dy, compare against falloffSq.
+      DistanceFast() only called for balls actually within range (~2-3 of 15
+      sources), not every ball-source pair.
+    - Pre-computed invFalloff = 1/falloff replaces per-shadow division.
+    - DynBSFactor2/DynBSFactor3 replace DynamicBSFactor^2 and ^3 per shadow.
+    - Cache UBound(BOT) → ubBot once at sub entry.
+    - Use pre-computed BS_d10/BS_d4/BS_d5/BS_d2/TW_d2/BS_dAM throughout
+      ambient shadow math (replaces BallSize/10, BallSize/4, etc.).
+    - Cache DSSources(AnotherSource)(0)/(1) → asx/asy for second shadow source.
+
+    SAVES: 3,000-6,000 COM reads/sec (15+ reads → 3 per ball × 5 balls × 60fps).
+    ~60 Sqr() calls/frame skipped via distance² gate (12 of 15 sources out of range).
+    ~300 divisions/sec eliminated (invFalloff multiplication, pre-computed constants).
+    ~120 exponentiations/sec eliminated (DynBSFactor2/3 pre-computed).
+
+
+10b. CoRTracker — PRE-ALLOCATE + SINGLE-PASS UPDATE (line ~3842)
+     Changed Class_Initialize from ReDim ballvel(0) to ReDim ballvel(tnob).
+     Same for ballvelx and ballvely.
+     Eliminated per-tick highestID scan loop (original iterated all balls
+     twice: once to find highestID, once to populate arrays).
+     Now single-pass: iterates once, populates directly.
+     Added UBound guard: If UBound(AllBalls) = -1 Then Exit Sub.
+     Kept ReDim Preserve expansion for ball IDs > current array bounds.
+     IMPORTANT: VPX ball .id auto-increments and never resets — during
+     multiball with ball create/destroy cycles (scoop DestroyBall +
+     vpmCreateBall), IDs can exceed tnob. The Dampen/Dampenf subs read
+     cor.ballvel(aBall.id) on rubber/flipper collisions, so silently
+     skipping high-ID balls causes subscript-out-of-range crashes.
+     Initial revision capped at tnob and skipped — this was the crash bug.
+
+     SAVES: ~200 loop iterations/sec (highestID scan eliminated).
+     Pre-alloc to tnob means ReDim Preserve only triggers when IDs
+     exceed 10 (rare, only during extended multiball sessions).
+
+
+11. PRE-COMPUTED CONSTANTS (line ~1935 + line ~4715)
+    Added at module level after DropCount (line ~1935):
+      BS_d10 = BallSize / 10
+      BS_d5  = BallSize / 5
+      BS_d4  = BallSize / 4
+      BS_d2  = BallSize / 2
+      TW_d2  = tablewidth / 2
+    These are safe here because BallSize (line 50) and tablewidth (line 46)
+    are declared above.
+
+    BS_dAM, DynBSFactor2, DynBSFactor3 are Dim-declared (no assignment) at
+    line ~1942, with actual assignments at line ~4715 immediately after the
+    shadow Const block (DynamicBSFactor, AmbientMovement at lines 4708-4710).
+    IMPORTANT: Initial revision assigned all values at line ~1935, but
+    AmbientMovement and DynamicBSFactor are Consts declared at line ~4708.
+    VBScript module-level code executes top-to-bottom, so forward-referencing
+    these Consts caused VBSE_OLE_NO_PROP_OR_METHOD compile error at line 1941.
+    This was the compile-error crash bug.
+
+    Used throughout RollingTimer (Fix 5) and DynamicBSUpdate (Fix 10).
+
+    SAVES: Eliminates ~600 divisions/frame from DynamicBSUpdate + RollingTimer
+    ambient shadow math.
+
+
+13. Logo_Timer — GUARD WRITES WITH DELTA CHECK (line ~2381)
+    Added module-level tracking: lastLFAngle, lastRFAngle, lastLF1Angle.
+    Cached LeftFlipper.CurrentAngle → aLF, RightFlipper.CurrentAngle → aRF,
+    LeftFlipper1.CurrentAngle → aLF1.
+    Only writes RotY/ObjRotZ when angle differs from last-written value.
+    Original wrote 6 COM properties unconditionally every tick.
+
+    SAVES: ~400-600 COM writes/sec when flippers at rest (6 writes × 100Hz
+    eliminated; only 3 COM reads remain for the comparison).
+
+
+14. CheckLiveCatch — CACHE Flipper.x, ELIMINATE REDUNDANT ABS (line ~3647)
+    Cached Flipper.startangle → sa, computed Dir from cached value.
+    Cached ABS(Flipper.x - ball.x) → flipDist, used for both > min and < max
+    comparisons (was reading Flipper.x twice).
+
+    SAVES: Minor (collision handler, not hot path). Clean code improvement.
+
+
+15. FlipperDeactivate — CACHE FLIPPER POSITION (line ~3588)
+    Cached Flipper.x → fx, Flipper.y → fy before Distance loop.
+    Original read Flipper.x and Flipper.y per ball in the loop.
+
+    SAVES: Minor (key-up handler, not hot path). Prevents per-ball COM reads.
+
+
+16. OnBallBallCollision — ^2 → v*v (line ~4552)
+    Replaced Csng(velocity) ^2 with v = Csng(velocity) : v * v.
+
+    SAVES: Minor (collision handler, not hot path).
+
+
+=============================================================================
+SUMMARY — ESTIMATED TOTAL SAVINGS
+=============================================================================
+
+Flipper system (Fixes 1-4, 13-15):
+  Before: ~50,000+ COM ops/sec (at 1000Hz with balls in play)
+  After:  ~2,000 COM ops/sec (at 100Hz with press guards)
+  Net:    ~48,000 COM ops/sec eliminated
+
+Ball shadow system (Fix 10):
+  Before: ~6,000 COM reads + 300 Sqr/frame
+  After:  ~1,500 COM reads + 60 Sqr/frame (with distance² gate)
+  Net:    ~270,000 COM reads/sec + 14,400 Sqr/sec eliminated (at 60fps)
+
+Rolling sounds (Fix 5):
+  Before: ~10 COM reads + 3 Sqr + 3 string allocs per ball per tick
+  After:  ~4 COM reads + 1 Sqr + 0 string allocs per ball per tick
+  Net:    ~4,000 COM reads/sec + 500 Sqr/sec + 1,500 allocs/sec eliminated
+
+Audio functions (Fix 6):
+  ~800 exponentiations/sec + ~400 divisions/sec eliminated
+
+Math functions (Fixes 7-9):
+  ~800 divisions/sec + ~1,900 exponentiations/sec eliminated
+
+Pre-computed constants (Fix 11):
+  ~600 divisions/frame eliminated from shadow math
+
+TOTAL ESTIMATED: ~55,000-65,000 COM operations/sec eliminated
+                  ~3,500 exponentiations/sec eliminated
+                  ~2,000 divisions/sec eliminated
+                  ~1,500 string allocations/sec eliminated
+                  ~15,000 Sqr() calls/sec eliminated
+
+
+=============================================================================
+BUG FIX HISTORY
+=============================================================================
+
+Rev 2 — Fixed two crash bugs from Rev 1:
+
+BUG 1: COMPILE ERROR — Forward-referenced Consts (line 1941)
+  SYMPTOM: VBSE_OLE_NO_PROP_OR_METHOD at line 1941 on table load.
+  CAUSE: BS_dAM = BallSize / AmbientMovement was placed at line 1941, but
+  AmbientMovement is a Const declared at line 4710. VBScript module-level
+  code executes top-to-bottom; the Const didn't exist yet at line 1941.
+  Same issue for DynBSFactor2/DynBSFactor3 referencing DynamicBSFactor
+  (declared at line 4708).
+  FIX: Split into Dim-only declaration (no assignment) at line 1942, with
+  actual value assignments at line 4715 immediately after the shadow Const
+  block. BS_d10/d5/d4/d2/TW_d2 were fine — they reference BallSize (line 50)
+  and tablewidth (line 46) which are declared earlier.
+  CASCADE: Lines 2758, 3866, 4863 errors were all downstream of this compile
+  failure — not independent bugs.
+
+BUG 2: SUBSCRIPT OUT OF RANGE — CoRTracker during multiball/scoop
+  SYMPTOM: Crash during multiball or when ball enters scoop.
+  CAUSE: CoRTracker.Update was changed to skip balls with .id > tnob (10).
+  But VPX ball .id auto-increments and never resets — during multiball with
+  ball create/destroy cycles (scoop does DestroyBall + vpmCreateBall), IDs
+  climb past 10. The Dampen/Dampenf subs read cor.ballvel(aBall.id) on
+  every rubber/flipper collision. When a ball with ID > 10 hit a rubber,
+  the array access crashed because Update had silently skipped that ID.
+  FIX: Restored ReDim Preserve expansion when ball ID exceeds current array
+  bounds. Pre-alloc to tnob still eliminates expansion in normal play;
+  ReDim Preserve only triggers when IDs exceed 10 during extended multiball.
+
+BUG 3: Dim INSIDE LOOP — DynamicBSUpdate
+  SYMPTOM: Potential VBScript error from Dim asx, asy inside For loop body.
+  CAUSE: VBScript does not allow Dim statements inside loop bodies.
+  FIX: Moved Dim asx, asy to the sub-level Dim declaration line.
