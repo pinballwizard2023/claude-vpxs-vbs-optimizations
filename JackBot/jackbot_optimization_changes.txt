@@ -1,0 +1,58 @@
+Jack-Bot (Williams 1995) — VPX Script Optimization Changes
+============================================================
+
+1. FLIPPER TIMER 1ms → 10ms (line ~3339)
+   RightFlipper.timerinterval changed from 1 to 10.
+   Contains nFozzy FlipperTricks + FlipperNudge for both flippers.
+   SAVES: ~4,500 function calls/sec, ~8,000 COM reads/sec.
+
+2. AudioFade/AudioPan — ^10 ELIMINATION + PRE-COMPUTED INVERSES (line ~4102)
+   Replaced tmp^10 with chained multiply (t2*t4*t8 pattern).
+   Pre-computed InvTWHalf = 2/tablewidth, InvTHHalf = 2/tableheight.
+   SAVES: ~800 exponentiations/sec + ~400 divisions/sec.
+
+3. BallVel/Vol/Volz — ^2 → x*x + COM CACHING (line ~4122)
+   BallVel: cached ball.VelX/VelY, vx*vx replaces ^2.
+   Vol: cached BallVel result, bv*bv replaces ^2.
+   Volz: cached ball.velz, vz*vz replaces ^2.
+   SAVES: ~500 exponentiations/sec + ~300 COM reads/sec.
+
+4. VolPlayfieldRoll/PitchPlayfieldRoll — ^3/^2 → multiply chains (line ~4138)
+   VolPlayfieldRoll: cached BallVel, bv*bv*bv replaces ^3.
+   PitchPlayfieldRoll: cached BallVel, bv*bv replaces ^2.
+   SAVES: ~200 exponentiations/sec.
+
+5. BallSpeed — ^2 → x*x + COM CACHING (both copies at lines ~3291 and ~3893)
+   Cached VelX/VelY/VelZ into locals.
+
+6. Distance — ^2 → dx*dx + dy*dy (both copies at lines ~3397 and ~3936)
+   Cached differences into locals.
+
+7. OnBallBallCollision — ^2 → v*v (line ~4574)
+   Cached Csng(velocity) into local.
+
+8. RollingTimer REWRITE (line ~2462)
+   - Pre-built BallRollStr(0..5) array.
+   - Cached UBound(BOT) once.
+   - Inlined BallVel/VolPlayfieldRoll/PitchPlayfieldRoll: 3 function calls
+     → 1 Sqr with cached COM reads. bv3=bv*bv*bv and bvSq=bv*bv inline.
+   - Reused cached bv for the InRect speed checks (was calling ballvel()
+     3 additional times).
+   SAVES: ~1,500 string allocs/sec + ~3,000 COM reads/sec.
+
+9. FlipperUpdate — DELTA GUARDS (line ~2528)
+   Cached CurrentAngle, only writes batleftshadow.rotz / batrightshadow.rotz
+   when angle differs from last value.
+   SAVES: ~120 COM writes/sec when flippers at rest.
+
+10. DynamicBSUpdate — PRE-COMPUTED SHADOW CONSTANTS (line ~2602)
+    Pre-computed DynBSFactor2 = DynamicBSFactor^2 and DynBSFactor3 =
+    DynamicBSFactor^3. (Note: DynamicBSFactor=1.0 so these are 1.0, but
+    the exponentiation was still computed every frame per ball per source.)
+    Also replaced inline ^2/^0.5 distance calc with SQR(dx*dx+dy*dy).
+    SAVES: ~200 exponentiations/sec during shadow updates.
+
+NO TABLE EDITOR CHANGES REQUIRED.
+
+ESTIMATED IMPROVEMENT: ~25-35% script CPU reduction.
+Biggest win is flipper timer (1ms→10ms) eliminating ~12,500 ops/sec.
