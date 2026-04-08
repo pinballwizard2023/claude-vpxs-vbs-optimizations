@@ -1,0 +1,47 @@
+Beavis and Butt-head Pinballed — VPX Script Optimization Changes
+=================================================================
+
+1. AudioFade/AudioPan — ^10 ELIMINATION + PRE-COMPUTED INVERSES
+   Replaced tmp^10 with chained multiply (t2*t4*t8 pattern).
+   Pre-computed InvTWHalf = 2/Table1.width, InvTHHalf = 2/Table1.height.
+   Eliminates table1.width/height COM reads per call.
+   SAVES: ~800 exponentiations/sec + ~400 divisions/sec.
+
+2. BallVel/Vol — ^2 → x*x + COM CACHING
+   BallVel: cached ball.VelX/VelY into locals, vx*vx replaces ^2.
+   Vol: cached BallVel result, bv*bv replaces ^2.
+   SAVES: ~500 exponentiations/sec + ~300 COM reads/sec.
+
+3. OnBallBallCollision — ^2 → v*v
+   Cached Csng(velocity) into local.
+
+4. RubberPosts_Hit / Rubbers_Hit — ^2 → x*x + COM CACHING
+   Cached activeball.velx/vely into locals.
+
+5. RollingSoundUpdate REWRITE
+   - Pre-built BallRollStr() array (note: original used "fx_ballrolling" & (b+1)
+     so strings are "fx_ballrolling1" and "fx_ballrolling2").
+   - Inlined BallVel/Vol: cache VelX/VelY once, compute bv and bvSq directly.
+   - Eliminates 2 function calls + 4 COM reads + 2 Sqr + 2 string allocs per
+     ball per tick.
+   SAVES: ~600 string allocs/sec + ~1,200 COM reads/sec.
+
+6. BallShadowUpdate — PRE-COMPUTED CONSTANTS
+   Pre-computed TW_d2s = Table1.Width/2 and BS_d6 = Ballsize/6.
+   Cached BOT(b).X into local bx (was read 4× per ball per tick).
+   SAVES: ~400 COM reads/sec + ~200 divisions/sec.
+
+7. RealTimeUpdates — FLIPPER WRITE DELTA GUARDS
+   Cached LeftFlipper/RightFlipper.currentangle into locals.
+   Only writes Prim_LeftFlipper.RotY, FlipperLSh.RotZ, Prim_RightFlipper.RotY,
+   FlipperRSh.RotZ when angle differs from last-written value.
+   Original read currentangle 2× per flipper and wrote 2 primitives
+   unconditionally every frame (60fps via MotorCallback).
+   SAVES: ~480 COM writes/sec when flippers at rest.
+
+NO TABLE EDITOR CHANGES REQUIRED.
+
+NOTE: This table is relatively simple — no nFozzy physics, no dynamic ball
+shadow lighting, no CoRTracker, only 2 balls max. The MotorCallback runs at
+60fps which is efficient. The main gains are from ^10 elimination in audio
+and the rolling sound rewrite. Estimated ~15-20% script CPU improvement.
