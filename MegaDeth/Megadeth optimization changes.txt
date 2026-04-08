@@ -1,0 +1,179 @@
+Megadeth v1.32 (vpxFile.vbs) — ALP4K Performance Optimization
+==============================================================
+Target: AtGames Legends Pinball 4K (RK3588 / Mali-G610, VPX Standalone ARM)
+21 optimizations applied
+
+Table: Megadeth v1.32 based on JPSalas Serious Sam Pinball II
+tnob=10, lob=2 (up to 10 balls, multiball table)
+
+Key structural notes:
+- No pre-existing persistent gBOT — RollingUpdate, FlipperNudge, FlipperDeactivate,
+  CoRTracker.Update, and GIUpdateTimer all called GetBalls() independently
+- GameTimer_Timer (10ms): only called RollingUpdate
+- RDampen_Timer (10ms): only called Cor.Update
+- RealTime_Timer (frame-rate): flipper logo angles - 2 redundant CurrentAngle reads
+- No LampFilter, no DynamicBSUpdate
+
+──────────────────────────────────────────────────────
+OPT-01  Module-level gBOT_shared + pre-built string arrays
+──────────────────────────────────────────────────────
+Before: Every hot-path sub called GetBalls() independently per tick.
+After:  gBOT_shared / gBOTReady declared at module level with safe init
+        (On Error Resume Next guard). Pre-built at startup:
+        - BallRollStr(0..10): "BallRoll_0".."BallRoll_10"
+        - RampLoopStr(1..6): "RampLoop1".."RampLoop6"
+        - WireLoopStr(1..6): "wireloop1".."wireloop6"
+
+──────────────────────────────────────────────────────
+OPT-02  GameTimer_Timer — refresh gBOT_shared once per 10ms tick
+──────────────────────────────────────────────────────
+Before: GameTimer only called RollingUpdate, which did its own GetBalls().
+After:  gBOT_shared = GetBalls at top of GameTimer; RollingUpdate reuses it.
+
+──────────────────────────────────────────────────────
+OPT-03  RDampen_Timer — refresh gBOT_shared once per 10ms tick
+──────────────────────────────────────────────────────
+Before: RDampen only called Cor.Update, which did its own GetBalls().
+After:  gBOT_shared = GetBalls at top of RDampen; Cor.Update reuses it.
+
+──────────────────────────────────────────────────────
+OPT-04  RollingUpdate — use gBOT_shared, pre-built BallRollStr, cache BallVel
+──────────────────────────────────────────────────────
+Before: Local gBOT = GetBalls each call; "BallRoll_" & b string concat x2 per ball.
+After:  Uses gBOT_shared with gBOTReady guard. BallRollStr(b) pre-built array.
+        BallVel result cached into ruBV to avoid double-call per iteration.
+
+──────────────────────────────────────────────────────
+OPT-05  CoRTracker.Update — use gBOT_shared, inline BallSpeed
+──────────────────────────────────────────────────────
+Before: GetBalls() COM allocation + BallSpeed(b) per ball (3 more COM reads).
+After:  Iterates gBOT_shared. Caches corvx/corvy/corvz and inlines Sqr().
+        Zero COM array allocations per 10ms tick.
+
+──────────────────────────────────────────────────────
+OPT-06  FlipperNudge — use gBOT_shared, cache currentangle, remove GetBalls
+──────────────────────────────────────────────────────
+Before: gBOT = GetBalls at the top unconditionally every 1ms call.
+After:  Uses gBOT_shared with gBOTReady guard. fnCA1 caches Flipper1.currentangle.
+        Eliminates one GetBalls() COM array allocation per ms.
+
+──────────────────────────────────────────────────────
+OPT-07  FlipperDeactivate — use gBOT_shared, remove GetBalls
+──────────────────────────────────────────────────────
+Before: Local gBOT = GetBalls inside the cradle-check block.
+After:  Uses gBOT_shared with gBOTReady guard.
+
+──────────────────────────────────────────────────────
+OPT-08  FlipperTricks — cache startangle and currentangle
+──────────────────────────────────────────────────────
+Before: Flipper.startangle read 2x, Flipper.currentangle read 3x per call.
+After:  ftSA = Flipper.startangle : ftCA = Flipper.currentangle, used throughout.
+        Called every 1ms for both flippers = 2000+ COM reads/sec eliminated.
+
+──────────────────────────────────────────────────────
+OPT-09  BallSpeed() — eliminate ^2 exponentiation x3
+──────────────────────────────────────────────────────
+Before: Sqr(ball.VelX^2 + ball.VelY^2 + ball.VelZ^2)
+After:  Cache into bsvx/bsvy/bsvz; bsvx*bsvx + bsvy*bsvy + bsvz*bsvz.
+
+──────────────────────────────────────────────────────
+OPT-10  BallVel() — eliminate ^2 exponentiation x2
+──────────────────────────────────────────────────────
+Before: Int(Sqr((ball.VelX^2) + (ball.VelY^2)))
+After:  Cache into bvvx/bvvy; bvvx*bvvx + bvvy*bvvy.
+        Called every 10ms per ball in RollingUpdate and RampRollUpdate.
+
+──────────────────────────────────────────────────────
+OPT-11  Vol() — eliminate ^2 exponentiation
+──────────────────────────────────────────────────────
+Before: CSng(BallVel(ball)^2)
+After:  vbv = BallVel(ball) : CSng(vbv*vbv)
+
+──────────────────────────────────────────────────────
+OPT-12  VolPlayfieldRoll() — eliminate ^3 exponentiation
+──────────────────────────────────────────────────────
+Before: CSng(BallVel(ball)^3)
+After:  vprbv*vprbv*vprbv — called every 10ms per rolling ball.
+
+──────────────────────────────────────────────────────
+OPT-13  PitchPlayfieldRoll() — eliminate ^2 exponentiation
+──────────────────────────────────────────────────────
+Before: BallVel(ball)^2 * 15
+After:  pprbv*pprbv*15 — called every 10ms per rolling ball.
+
+──────────────────────────────────────────────────────
+OPT-14  AudioFade() — replace ^10 with multiply chain
+──────────────────────────────────────────────────────
+Before: tmp^10 / ((-tmp)^10) — floating-point power on every sound event.
+After:  t2=tmp*tmp : t4=t2*t2 : t8=t4*t4 : result=t8*t2 (3 multiplies total).
+
+──────────────────────────────────────────────────────
+OPT-15  AudioPan() — replace ^10 with multiply chain
+──────────────────────────────────────────────────────
+Same pattern as AudioFade. Called on every sound event.
+
+──────────────────────────────────────────────────────
+OPT-16  Distance() — eliminate ^2 exponentiation x2
+──────────────────────────────────────────────────────
+Before: Sqr((ax-bx)^2 + (ay-by)^2)
+After:  ddx=ax-bx : ddy=ay-by : Sqr(ddx*ddx + ddy*ddy)
+        Called in FlipperTrigger (1ms timer) and FlipperDeactivate.
+
+──────────────────────────────────────────────────────
+OPT-17  TargetBouncer() — eliminate vel^2 and vratio^2
+──────────────────────────────────────────────────────
+Before: (vel^2 - aBall.velz^2) / (1 + vratio^2)
+After:  (vel*vel - aBall.velz*aBall.velz) / (1 + vratio*vratio)
+
+──────────────────────────────────────────────────────
+OPT-18  RampRollUpdate() — pre-built RampLoopStr/WireLoopStr arrays
+──────────────────────────────────────────────────────
+Before: "RampLoop" & x and "wireloop" & x concat on every timer tick
+        (up to 10 concats per call when balls are on ramps).
+After:  RampLoopStr(x) and WireLoopStr(x) pre-built arrays.
+
+──────────────────────────────────────────────────────
+OPT-19  RealTime_Timer — cache flipper CurrentAngle into locals
+──────────────────────────────────────────────────────
+Before: LeftFlipper.CurrentAngle and RightFlipper.CurrentAngle each read
+        once per frame as separate COM calls.
+After:  rtLCA/rtRCA locals assigned once, used for LFLogo/RFLogo.RotZ.
+
+──────────────────────────────────────────────────────
+OPT-20  CoRTracker arrays pre-allocated to tnob — eliminates multiball ReDim stutter
+──────────────────────────────────────────────────────
+Before: ballvel/ballvelx/ballvely initialized at size 0. Each time a ball
+        with an ID higher than the current array bound appeared, VBScript
+        ReDim'd and copied all three arrays. During multiball start, multiple
+        balls are created in rapid succession with incrementing IDs, causing
+        several consecutive ReDim+copy operations within a few 10ms ticks —
+        the primary cause of the multiball stutter spike.
+After:  Arrays initialized to ReDim ballvel(tnob) / ballvelx(tnob) /
+        ballvely(tnob) at Class_Initialize. In normal play ball IDs never
+        exceed tnob, so the ReDim check in Update() is a no-op every tick.
+        The safety ReDim is still present for edge cases but will not fire
+        during normal multiball operation.
+
+──────────────────────────────────────────────────────
+OPT-21  GIUpdateTimer_Timer — replace GetBalls with gBOT_shared
+──────────────────────────────────────────────────────
+Before: Every GIUpdateTimer tick called GetBalls() independently to check
+        ball count — an additional COM array allocation not covered in the
+        first optimization pass.
+After:  Reads UBound(gBOT_shared) directly with gBOTReady guard.
+        Eliminates one more GetBalls() allocation per timer interval.
+
+──────────────────────────────────────────────────────
+NOT CHANGED (intentional)
+──────────────────────────────────────────────────────
+- Volz() ^2: event-driven (ball drop sounds only), not per-frame
+- OnBallBallCollision velocity^2: event-driven
+- "RampLoop" & x / "wireloop" & x in WRemoveBall: event-driven ball
+  removal only, not a per-tick hot loop
+- ChangeGi() called from CreateNewBall(): loops all GI lights writing
+  .color/.colorfull on each — table author's design for multiball GI
+  color change, fires synchronously at ball-create time. Cannot be
+  eliminated from VBS without changing game behaviour.
+- .color / .colorfull writes in SetLightColor: unsigned 32-bit color
+  comparison causes VBScript type mismatch crash — never guarded,
+  per established safety rule across all tables
