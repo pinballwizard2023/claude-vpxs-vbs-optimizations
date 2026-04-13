@@ -1,0 +1,184 @@
+High_Speed_Optimized.vbs Optimization Changes
+=================================================
+Source: High_Speed__Williams_1986_MOD_3_1_FlexDMD.vbs
+Table: High Speed (Williams 1986) MOD 3.1 FlexDMD
+By 32a & Chokeee, with VR by Rawd
+
+
+1. BallSpeed() — ^2×3 REPLACED WITH MULTIPLICATIONS  (line ~835)
+   Was: Sqr(ball.VelX^2 + ball.VelY^2 + ball.VelZ^2)  — 3 slow ^-exp ops + 3 COM reads
+   Now: Dim vx,vy,vz : vx=ball.VelX : vy=ball.VelY : vz=ball.VelZ
+        BallSpeed = Sqr(vx*vx + vy*vy + vz*vz)
+   Why: VBScript's ^ operator uses the slow log/exp path even for integer exponents.
+        Caches VelX/VelY/VelZ into locals; replaces 3 ^-exp with multiplications.
+   Called from: Dampener.Dampen (per rubber hit), TargetBouncer (per target hit),
+                CoRTracker (every GameTimer tick).
+   Saves: ~3 ^-exp ops per call × frequency = ~500 ^-exp/sec eliminated.
+
+
+2. Distance() — ^2 REPLACED WITH MULTIPLICATIONS  (line ~937)
+   Was: Sqr((ax-bx)^2 + (ay-by)^2)
+   Now: Dim dx,dy : dx=ax-bx : dy=ay-by : Distance = Sqr(dx*dx + dy*dy)
+   Why: Same ^-exp issue. Distance() called from DynamicBSUpdate (per ball per frame),
+        FlipperTrigger, FlipperDeactivate cradle check.
+   Saves: ~2 ^-exp ops per call.
+
+
+3. PRE-COMPUTED TRIG CONSTANTS PIover180 / d180overPI  (line ~923)
+   Added after `Const PI = 3.1415927`:
+     Dim PIover180  : PIover180  = PI / 180
+     Dim d180overPI : d180overPI = 180 / PI
+   Applied in:
+     dSin:      * Pi/180  → * PIover180
+     dCos:      * Pi/180  → * PIover180
+     Radians(): * PI/180  → * PIover180
+     AnglePP(): * 180/PI  → * d180overPI
+   Why: Eliminates 2 divisions per trig call. dSin/dCos called from bumper ring animations
+        (3 bumpers), DynamicBSUpdate (AnglePP per ball per source per frame).
+   Saves: ~2 divisions eliminated per trig call × frequency.
+
+
+4. BallVel() — ^2 REPLACED WITH MULTIPLICATIONS  (line ~2700)
+   Was: INT(SQR((ball.VelX ^2) + (ball.VelY ^2)))
+   Now: Dim vx,vy : vx=ball.VelX : vy=ball.VelY : BallVel = INT(SQR(vx*vx + vy*vy))
+   Why: Called from Vol(), Pitch(), VolPlayfieldRoll(), PitchPlayfieldRoll(), and
+        directly in RollingUpdate per ball per tick.
+   Saves: ~2 ^-exp per call × ~10 calls/frame = ~1200 ^-exp/sec.
+
+
+5. Vol() — ^2 REPLACED WITH MULTIPLICATION  (line ~2689)
+   Was: Csng(BallVel(ball) ^2)
+   Now: Dim bv : bv = BallVel(ball) : Vol = Csng(bv * bv)
+   Why: Caches BallVel result and replaces ^2.
+   Saves: 1 ^-exp per call.
+
+
+6. Volz() — ^2 REPLACED WITH MULTIPLICATION  (line ~2692)
+   Was: Csng((ball.velz) ^2)
+   Now: Dim vz : vz = ball.velz : Volz = Csng(vz * vz)
+   Why: Caches COM read and replaces ^2.
+   Saves: 1 ^-exp + 1 COM read per call.
+
+
+7. VolPlayfieldRoll() — ^3 REPLACED + BallVel CACHED  (line ~2704)
+   Was: RollingSoundFactor * 0.0005 * Csng(BallVel(ball) ^3)
+   Now: Dim bv : bv = BallVel(ball) : VolPlayfieldRoll = RollingSoundFactor * 0.0005 * Csng(bv*bv*bv)
+   Why: Caches BallVel and replaces ^3 with multiplications.
+   Called per ball per RollingUpdate tick (100Hz).
+   Saves: 1 ^-exp + 1 redundant BallVel call per ball per tick.
+
+
+8. PitchPlayfieldRoll() — ^2 REPLACED + BallVel CACHED  (line ~2708)
+   Was: BallVel(ball) ^2 * 15
+   Now: Dim bv : bv = BallVel(ball) : PitchPlayfieldRoll = bv * bv * 15
+   Why: Same pattern — caches BallVel and replaces ^2.
+   Saves: 1 ^-exp + 1 redundant BallVel call per ball per tick.
+
+
+9. TargetBouncer — ^2×3 ELIMINATED  (line ~263)
+   Was: vel^2, aBall.velz^2, vratio^2 in bounce calculation.
+   Now: vel*vel, velz2*velz2, vratio*vratio using cached locals.
+   Why: Eliminates 3 ^-exp ops per target hit.
+   Called on standup target hits (~5-15/sec during gameplay).
+   Saves: 3 ^-exp per hit × hit frequency.
+
+
+10. FlashFlasher — ^2.5, ^3, ^2 ELIMINATED  (line ~2155)
+    Was: ObjLevel(nr)^2.5, ObjLevel(nr)^3, ObjLevel(nr)^2 computed 5 separate times,
+         plus ObjLevel(nr) read from array 7 times.
+    Now: ol = ObjLevel(nr) cached once. ol2 = ol*ol, ol3 = ol2*ol, ol25 = ol2*Sqr(ol).
+         All 5 expressions use cached powers.
+    Why: FlashFlasher runs on a timer per active flasher dome (6 flashers on this table).
+         When multiple flashers fire simultaneously, this is called 6× per timer tick.
+    Saves: ~5 ^-exp per flasher per tick × 6 flashers = ~30 ^-exp/sec during flash events.
+
+
+11. DynamicBSFactor^2 AND ^3 — REPLACED WITH LITERAL  (line ~4223)
+    Was: ShadowOpacity*DynamicBSFactor^2 and ShadowOpacity*DynamicBSFactor^3
+    Now: ShadowOpacity*1 (DynamicBSFactor is Const 1, so 1^N = 1)
+    Why: VBScript still evaluates ^2 and ^3 via log/exp even when base is 1.
+         Called per ball per shadow source per frame.
+    Saves: ~3 ^-exp per ball per frame eliminated.
+
+
+12. LampFilter ^1.6 — REPLACED WITH 101-ENTRY LUT  (line ~3806)
+    Was: LampFilter = aLvl^1.6  — called via Lampz.FilterOut every frame per lamp.
+    Now: 101-entry LUT pre-built at init: LampFilterLUT(0..100) = (i/100)^1.6
+         LampFilter does idx = Int(aLvl*100+0.5) then returns LampFilterLUT(idx).
+    Why: Lampz.Filter = "LampFilter" is set at init. Update() calls cFilter on every
+         active lamp every frame. With ~60+ active lamp indices × 60fps = ~3600+ calls/sec.
+    Saves: ~3600 ^-exp/sec → array lookups (much cheaper).
+
+
+13. DynamicBSUpdate — CONSTANT PRE-COMPUTATION  (line ~4120)
+    Was: tablewidth/2, BallSize/10, BallSize/5, BallSize/4, BallSize/AmbientMovement
+         computed inside per-ball shadow loop every frame.
+    Now: halfWidth, bsDiv10, bsDiv5, bsDiv4, bsDivAM pre-computed before loop.
+    Why: BallSize=50, tablewidth=fixed, AmbientMovement=2 — all constants being
+         divided ~20 times across the per-ball body.
+    Saves: ~20 divisions/ball/frame × 3 balls × 60fps = ~3,600 divisions/sec.
+
+
+14. DynamicBSUpdate — UBound(BOT) CACHED  (line ~4120)
+    Was: UBound(BOT) called 3 times (hide loop, exit check, main loop).
+    Now: Dim ubBOT : ubBOT = UBound(BOT) — cached once, reused.
+    Saves: 2 redundant UBound evaluations/frame × 60fps = ~120 ops/sec.
+
+
+15. RollingUpdate — UBound(BOT) CACHED  (line ~2400)
+    Was: UBound(BOT) called 3 times (stop loop, exit check, play loop).
+    Now: Dim ubBOT : ubBOT = UBound(BOT) — cached once, reused.
+    Called from RollingUpdate_timer at 10ms interval (100Hz).
+    Saves: 2 redundant UBound evaluations/tick × 100Hz = ~200 ops/sec.
+
+
+16. FLIPPER TIMER — PRESS GUARD + SHARED GetBalls  (line ~885)
+    Was: RightFlipper_timer called FlipperNudge twice, each calling GetBalls internally.
+         When no flippers held, all FlipperNudge work is wasted.
+    Now: Guard added: If LFPress=0 And RFPress=0 Then Exit Sub (before GetBalls).
+         Single GetBalls call shared across both FlipperNudge invocations.
+         FlipperNudge signature changed to accept pre-fetched BOT array.
+    Why: Flipper timer fires at 1000Hz (timerinterval=1). When no flippers held
+         (most of the time between shots), eliminates 100% of GetBalls + FlipperNudge work.
+    Saves: ~2000 GetBalls calls/sec eliminated at rest + all downstream work.
+
+
+17. LampFader.Update1 / Update2 — SIMPLIFIED BRANCHING  (line ~3748)
+    Was: elseif Not OnOff(x) then 'fade down
+    Now: else 'fade down
+    Why: OnOff(x) is boolean. If `if OnOff(x)` is not taken, it's necessarily False.
+         The `Not OnOff(x)` check is redundant. Loop iterates 0 to 140 every tick.
+    Saves: ~141 redundant boolean evals/tick × timer frequency.
+
+
+18. LampFader.Update — CACHED Lvl*Mult AND cFilter RESULT  (line ~3777)
+    Was: Lvl(x)*Mult(x) computed up to 3 times per lamp (IntensityScale, cFilter, Callback).
+         cFilter() called per-element for array lamps (same input, redundant).
+    Now: cachedLvl = Lvl(x)*Mult(x) — single multiplication.
+         filteredLvl = cFilter(cachedLvl) — single filter call before array loop.
+    Saves: ~60 redundant cFilter calls/frame + ~60 redundant multiplications/frame.
+
+
+19. LampFader.Update — DEBUG MSGBOX REMOVED  (line ~3793)
+    Was: if TypeName(lvl(x)) <> "Double" and typename(lvl(x)) <> "Integer" then msgbox "uhh..."
+    Now: (Removed)
+    Why: TypeName() is a COM reflection call on every lamp index (0-140) every frame.
+         If triggered, modal msgbox would freeze VPX.
+    Saves: ~282 TypeName calls/frame × 60fps = ~16,920 COM reflection ops/sec.
+
+
+SUMMARY OF OPS/SEC ELIMINATED (estimated, 3 balls in play, 60fps render, 100Hz timers):
+========================================================================================
+  Debug TypeName removal:                    ~16,920 COM reflection ops/sec
+  LampFilter ^1.6 → LUT:                     ~3,600 ^-exp/sec
+  DynamicBSUpdate division pre-compute:       ~3,600 divisions/sec
+  Flipper timer press guard + shared GetBalls:~2,000 GetBalls calls/sec (at rest)
+  LampFader.Update cFilter cache:             ~3,600 function calls + muls/sec
+  BallVel/Vol/VolPlayfieldRoll ^N:            ~1,200 ^-exp/sec
+  DynamicBSFactor^2/^3 literal:                ~360 ^-exp/sec
+  PI/180 division elimination:                 ~500 divisions/sec
+  FlashFlasher ^N elimination:                  ~30 ^-exp/sec (during flash events)
+  UBound caching (shadows + rolling):           ~320 array lookups/sec
+  Distance/BallSpeed ^2 elimination:            ~500 ^-exp/sec
+  TargetBouncer ^2 elimination:                 ~45 ^-exp/sec (during play)
+  LampFader branching simplification:          ~141 boolean evals/tick × frequency
